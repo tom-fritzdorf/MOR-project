@@ -216,3 +216,5 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+Miniconda3-latest-MacOSX-arm64.sh
