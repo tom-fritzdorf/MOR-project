@@ -69,13 +69,17 @@ def main() -> None:
     print(f"Computed {S_sup.shape[1]} supremizer snapshots")
 
     # --- 5. POD bases (separate POD on velocity and supremizers) ----
-    pod_u = PODBasis.from_velocity_and_supremizers(
-        snapshots.S_u, S_sup, problem.Mu,
-        energy_threshold=config.energy_threshold, name="u",
-    )
+    # pod_p first: pod_u's supremizer truncation needs r_p as a floor (see
+    # PODBasis.from_velocity_and_supremizers) to guarantee enough supremizer
+    # directions for the discrete inf-sup condition.
     pod_p = PODBasis.from_snapshots(snapshots.S_p, problem.Mp,
                                     energy_threshold=config.energy_threshold,
                                     name="p")
+    pod_u = PODBasis.from_velocity_and_supremizers(
+        snapshots.S_u, S_sup, problem.Mu,
+        energy_threshold=config.energy_threshold, name="u",
+        min_sup=pod_p.r,
+    )
     print(f"Velocity basis: r_primary={pod_u.r_primary}, "
           f"r_sup={pod_u.r_sup}, r_u_total={pod_u.r}")
     truncations = {lvl: (pod_u.modes_for_energy(lvl), pod_p.modes_for_energy(lvl))
@@ -94,11 +98,14 @@ def main() -> None:
     t_offline = time.time() - t_offline_start
 
     # --- 7. ROM coefficients on training set (for Task 2 PODNN) -----
+    # POD-NN targets are the M-orthogonal projection of the *true* FOM
+    # snapshot onto the POD basis (Hesthaven & Ubbiali 2018) -- i.e. what the
+    # reduced coordinates of the training data actually are -- rather than a
+    # re-solved ROM Galerkin system. This is exact (no Newton needed) and
+    # sidesteps cold-started ROM Newton robustness issues entirely.
     rom_coeffs_train = np.zeros((operators.r_u + operators.r_p, train_params.shape[0]))
-    for i, (mu0, mu1) in enumerate(tqdm(train_params, desc="ROM solves [train]")):
-        res = rom.solve(mu0, mu1)
-        rom_coeffs_train[:operators.r_u, i] = res.a
-        rom_coeffs_train[operators.r_u:, i] = res.b
+    rom_coeffs_train[:operators.r_u, :] = pod_u.Phi.T @ (problem.Mu @ snapshots.S_u)
+    rom_coeffs_train[operators.r_u:, :] = pod_p.Phi.T @ (problem.Mp @ snapshots.S_p)
 
     # --- 8. Test-set: FOM + ROM + errors ----------------------------
     err_analyzer = ErrorAnalyzer(problem)
@@ -111,13 +118,17 @@ def main() -> None:
     rom_times_test = np.zeros(M_test)
     rom_coeffs_test = np.zeros((operators.r_u + operators.r_p, M_test))
 
-    test_order = np.argsort(-test_params[:, 0])
+    # lexsort (not plain argsort) so ties in mu0 are broken by ascending
+    # mu1 -- keeps both the FOM and ROM warm-starts walking mu1 smoothly.
+    test_order = np.lexsort((test_params[:, 1], -test_params[:, 0]))
     w_prev = None
+    a_prev, b_prev = None, None
     for idx in tqdm(test_order, desc="Test set FOM+ROM"):
         mu0, mu1 = test_params[idx]
         fom_res = fom.solve(mu0, mu1, w_init=w_prev)
         w_prev = fom_res.w
-        rom_res = rom.solve(mu0, mu1)
+        rom_res = rom.solve(mu0, mu1, a_init=a_prev, b_init=b_prev)
+        a_prev, b_prev = rom_res.a, rom_res.b
         u_rom, p_rom = rom.reconstruct(rom_res.a, rom_res.b)
 
         fom_u_test[:, idx] = fom_res.u
@@ -144,28 +155,119 @@ def main() -> None:
           f"mean ROM time = {rom_times_test.mean():.4f}s,  "
           f"speedup = {mean_speedup:.1f}x")
 
-    # --- 9. Error-vs-modes sweep ------------------------------------
-    max_Nr = min(operators.r_u, 40)
-    Nrs = np.arange(2, max_Nr + 1, 2)
-    sweep_u, sweep_p = [], []
-    for Nr in tqdm(Nrs, desc="Error sweep"):
-        Np_s = min(Nr, operators.r_p)
-        sub_pod_u = pod_u.truncate(Nr)
+    # --- 9. Error-vs-modes sweep (paired primary+supremizer growth) -
+    # Growing supremizer modes in lockstep with primary modes keeps the
+    # reduced pair inf-sup stable at every truncation level (see
+    # data/infsup_sweep.csv / plot 11 for what happens without this).
+    max_N = min(pod_u.r_primary, pod_u.r_sup)
+    Ns = np.arange(1, max_N + 1)
+    Nrs, sweep_u, sweep_p, sweep_max_u, sweep_h1_u = [], [], [], [], []
+    sweep_rom_times, sweep_speedups = [], []
+    # Sorted purely to give each sub-ROM's Newton solves a smooth
+    # warm-start walk in mu1; array writes below still use the original
+    # index i, so result ordering/alignment is unaffected.
+    sweep_iter_order = np.lexsort((test_params[:, 1], -test_params[:, 0]))
+    for N in tqdm(Ns, desc="Error sweep (paired)"):
+        u_idx = pod_u.paired_indices(int(N))
+        p_idx = np.arange(min(int(N), operators.r_p))
+        sub_pod_u = pod_u.truncate_by_indices(u_idx)
+        sub_pod_p = pod_p.truncate_by_indices(p_idx)
+        sub_ops = operators.truncate_indices(u_idx, p_idx)
+        sub_rom = ROMSolver(problem, sub_ops, sub_pod_u.Phi, sub_pod_p.Phi)
+        eu_list, ep_list, eh_list, t_list = [None] * M_test, [None] * M_test, [None] * M_test, [None] * M_test
+        a_prev, b_prev = None, None
+        for i in sweep_iter_order:
+            mu0, mu1 = test_params[i]
+            r = sub_rom.solve(mu0, mu1, a_init=a_prev, b_init=b_prev)
+            a_prev, b_prev = r.a, r.b
+            t_list[i] = r.solve_time
+            u_r, p_r = sub_rom.reconstruct(r.a, r.b)
+            eu, ep, eh = err_analyzer.relative_errors(
+                fom_u_test[:, i], fom_p_test[:, i], u_r, p_r,
+            )
+            eu_list[i] = eu; ep_list[i] = ep; eh_list[i] = eh
+        Nrs.append(u_idx.size)
+        sweep_u.append(float(np.mean(eu_list)))
+        sweep_p.append(float(np.mean(ep_list)))
+        sweep_max_u.append(float(np.max(eu_list)))
+        sweep_h1_u.append(float(np.mean(eh_list)))
+        mean_t = float(np.mean(t_list))
+        sweep_rom_times.append(mean_t)
+        sweep_speedups.append(fom_times_test.mean() / max(mean_t, 1e-12))
+    Nrs          = np.array(Nrs)
+    sweep_u      = np.array(sweep_u)
+    sweep_p      = np.array(sweep_p)
+    sweep_max_u  = np.array(sweep_max_u)
+    sweep_h1_u   = np.array(sweep_h1_u)
+    sweep_rom_times  = np.array(sweep_rom_times)
+    sweep_speedups   = np.array(sweep_speedups)
+
+    # --- Print comparison table ---
+    fom_mean_t = fom_times_test.mean()
+    print(f"\nMode comparison table (FOM mean time = {fom_mean_t:.3f} s, "
+          f"{M_test} test samples):")
+    hdr = (f"{'r_u':>4} {'r_p':>4} {'L2(u)mean':>11} {'L2(u)max':>11} "
+           f"{'L2(p)mean':>11} {'H1(u)mean':>11} {'ROMtime(s)':>11} {'Speedup':>9}")
+    print(hdr)
+    print("-" * len(hdr))
+    for i, N in enumerate(Ns):
+        Np_s = min(int(N), operators.r_p)
+        print(f"{Nrs[i]:>4} {Np_s:>4} {sweep_u[i]:>11.3e} {sweep_max_u[i]:>11.3e} "
+              f"{sweep_p[i]:>11.3e} {sweep_h1_u[i]:>11.3e} "
+              f"{sweep_rom_times[i]:>11.4f} {sweep_speedups[i]:>8.1f}x")
+
+    # --- Save comparison table as CSV ---
+    import csv
+    csv_path = config.data_dir / "mode_comparison.csv"
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["r_u", "r_p", "mean_l2_u", "max_l2_u",
+                    "mean_l2_p", "mean_h1_u", "rom_time_s", "speedup"])
+        for i, N in enumerate(Ns):
+            Np_s = min(int(N), operators.r_p)
+            w.writerow([int(Nrs[i]), Np_s, sweep_u[i], sweep_max_u[i],
+                        sweep_p[i], sweep_h1_u[i],
+                        sweep_rom_times[i], sweep_speedups[i]])
+    print(f"Mode comparison table saved to: {csv_path}")
+
+    # --- 9b. Inf-sup instability diagnostic (primary-only, no supremizer) --
+    # Deliberately unstable by construction: for r <= r_primary the reduced
+    # velocity space contains no supremizer modes, so it is exactly
+    # divergence-free (built from FOM snapshots satisfying B_h u_h = 0) and
+    # cannot see the pressure gradient at all -- B_r ~ 0 to machine
+    # precision, the reduced saddle-point Jacobian is singular, and Newton
+    # never moves away from a=0. Kept as a standalone labeled diagnostic
+    # (plot 11) that mirrors the class notes' inf-sup / supremizer section,
+    # rather than contaminating the main convergence sweep above.
+    rs_instab = np.arange(1, pod_u.r_primary + 1)
+    eu_instab, ep_instab = [], []
+    for r in tqdm(rs_instab, desc="Inf-sup instability sweep"):
+        Np_s = min(int(r), operators.r_p)
+        sub_pod_u = pod_u.truncate(int(r))
         sub_pod_p = pod_p.truncate(Np_s)
-        sub_ops = operators.truncate(Nr, Np_s)
+        sub_ops = operators.truncate(int(r), Np_s)
         sub_rom = ROMSolver(problem, sub_ops, sub_pod_u.Phi, sub_pod_p.Phi)
         eu_list, ep_list = [], []
         for i in range(M_test):
             mu0, mu1 = test_params[i]
-            r = sub_rom.solve(mu0, mu1)
-            u_r, p_r = sub_rom.reconstruct(r.a, r.b)
+            res = sub_rom.solve(mu0, mu1)
+            u_r, p_r = sub_rom.reconstruct(res.a, res.b)
             eu, ep, _ = err_analyzer.relative_errors(
                 fom_u_test[:, i], fom_p_test[:, i], u_r, p_r,
             )
             eu_list.append(eu); ep_list.append(ep)
-        sweep_u.append(np.mean(eu_list))
-        sweep_p.append(np.mean(ep_list))
-    sweep_u = np.array(sweep_u); sweep_p = np.array(sweep_p)
+        eu_instab.append(float(np.mean(eu_list)))
+        ep_instab.append(float(np.mean(ep_list)))
+    eu_instab = np.array(eu_instab)
+    ep_instab = np.array(ep_instab)
+
+    infsup_csv_path = config.data_dir / "infsup_sweep.csv"
+    with open(infsup_csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["r", "mean_l2_u", "mean_l2_p"])
+        for i, r in enumerate(rs_instab):
+            w.writerow([int(r), eu_instab[i], ep_instab[i]])
+    print(f"Inf-sup instability sweep saved to: {infsup_csv_path}")
 
     # --- 10. Representative Newton residual histories (Plot 9) ------
     rep_idx = int(np.argsort(test_params[:, 0])[0])    # smallest mu0 (hardest)
@@ -178,6 +280,8 @@ def main() -> None:
     # =================================================================
     print("\nGenerating plots...")
     vis = Visualizer(problem)
+
+    vis.plot_mesh()
 
     # Plot 1: need a small wrapper so the Visualizer can warm-start FOM solves.
     def fom_for_showcase(mu0, mu1, w_init=None):
@@ -194,10 +298,12 @@ def main() -> None:
     vis.plot_pod_modes(pod_u.Phi, pod_p.Phi)
     vis.plot_rom_vs_fom(test_params, fom_u_test, rom_u_test)
     vis.plot_error_vs_modes(Nrs, sweep_u, sweep_p)
+    vis.plot_mode_comparison(Nrs, sweep_u, sweep_p, sweep_h1_u, sweep_speedups)
     vis.plot_error_parameter_space(test_params, report.rel_l2_u)
     vis.plot_speedup(fom_times_test.mean(), rom_times_test.mean(), t_offline)
     vis.plot_newton_convergence(fom_track.residuals or [], rom_track.residuals)
-    print(f"Saved 9 plots to: {config.plots_dir}")
+    vis.plot_infsup_instability(rs_instab, eu_instab, ep_instab, pod_u.r_primary)
+    print(f"Saved 11 plots to: {config.plots_dir}")
 
     # =================================================================
     # Persist data for Tasks 2-4
@@ -231,6 +337,8 @@ def main() -> None:
     np.savez_compressed(
         config.data_dir / "error_sweep.npz",
         Nrs=Nrs, mean_u=sweep_u, mean_p=sweep_p,
+        max_u=sweep_max_u, mean_h1_u=sweep_h1_u,
+        rom_times=sweep_rom_times, speedups=sweep_speedups,
     )
     np.savez_compressed(
         config.data_dir / "test_errors.npz",

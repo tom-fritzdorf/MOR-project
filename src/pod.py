@@ -54,10 +54,16 @@ class ParameterSampler:
         self.config = config
 
     def train(self) -> np.ndarray:
-        """Uniform tensor grid of shape ``(n_train_per_dim**2, 2)``."""
+        """Anisotropic tensor grid, shape ``(n_train_mu0 * n_train_mu1, 2)``.
+
+        mu1 gets a much finer grid than mu0: the forcing term's
+        cos(mu1^2 pi x)-type oscillation makes the solution manifold vary
+        far more steeply along mu1 (reshapes the field) than along mu0
+        (mostly rescales amplitude).
+        """
         c = self.config
-        mu0 = np.linspace(c.mu0_range[0], c.mu0_range[1], c.n_train_per_dim)
-        mu1 = np.linspace(c.mu1_range[0], c.mu1_range[1], c.n_train_per_dim)
+        mu0 = np.linspace(c.mu0_range[0], c.mu0_range[1], c.n_train_mu0)
+        mu1 = np.linspace(c.mu1_range[0], c.mu1_range[1], c.n_train_mu1)
         MM0, MM1 = np.meshgrid(mu0, mu1, indexing="ij")
         return np.stack([MM0.ravel(), MM1.ravel()], axis=1)
 
@@ -122,8 +128,9 @@ class SnapshotCollector:
                 ) -> SnapshotData:
         """Solve the FOM at every parameter in ``params``.
 
-        We sort by descending ``mu0`` (most diffusive first) and warm-start
-        from the previous solution, which is critical at high Reynolds.
+        We sort by descending ``mu0`` (most diffusive first), tie-broken by
+        ascending ``mu1``, and warm-start from the previous solution, which
+        is critical at high Reynolds.
         """
         N_u, N_p = self.problem.N_u, self.problem.N_p
         M = params.shape[0]
@@ -132,7 +139,12 @@ class SnapshotCollector:
         times = np.zeros(M)
         iters = np.zeros(M, dtype=int)
 
-        order = np.argsort(-params[:, 0])
+        # np.argsort is not stable, so sorting on mu0 alone scrambles the
+        # mu1 order within each mu0 tie-group (common on a tensor grid) and
+        # breaks the warm-start continuation -- lexsort makes the mu1 walk
+        # smooth within each mu0 block, which matters a lot when mu1 is
+        # densely sampled.
+        order = np.lexsort((params[:, 1], -params[:, 0]))
         w_prev = None
         for idx in tqdm(order, desc=f"FOM [{label}]"):
             mu0, mu1 = params[idx]
@@ -225,7 +237,7 @@ class PODBasis:
     @classmethod
     def from_snapshots(cls, S: np.ndarray, M_inner: sp.csr_matrix,
                        energy_threshold: float = 0.9999,
-                       name: str = "u") -> "PODBasis":
+                       name: str = "u", min_r: int = 0) -> "PODBasis":
         # Correlation matrix in the M-inner product
         MS = M_inner @ S
         C = S.T @ MS
@@ -248,6 +260,12 @@ class PODBasis:
         # Drop modes with vanishing singular value (numerical safety)
         nonzero = int(np.sum(sigmas > 1e-12 * (sigmas[0] if sigmas[0] > 0 else 1)))
         r = min(r, max(nonzero, 1))
+        # Optional floor (e.g. supremizer POD must keep >= r_p modes for the
+        # discrete inf-sup condition; the energy threshold alone gives no such
+        # guarantee since the supremizer and pressure manifolds decay at
+        # different rates), capped by the modes actually resolvable.
+        if min_r > 0:
+            r = max(r, min(min_r, max(nonzero, 1)))
 
         # Reconstruct modes: Phi[:, k] = S V[:, k] / sigma_k, then M-Gram-Schmidt
         Phi = np.zeros((S.shape[0], r))
@@ -267,6 +285,7 @@ class PODBasis:
         M_inner: sp.csr_matrix,
         energy_threshold: float = 0.9999,
         name: str = "u",
+        min_sup: int = 0,
     ) -> "PODBasis":
         """Textbook supremizer-enriched velocity POD (Ballarin-Rozza style).
 
@@ -274,13 +293,22 @@ class PODBasis:
         on the supremizer snapshots, then M-orthonormalises the concatenation
         ``[Phi_u^primary | Phi_u^sup]``. Storing the primary block first keeps
         the truncation API intuitive (drop supremizers last).
+
+        ``min_sup`` should be set to (at least) the number of retained pressure
+        POD modes ``r_p``: the discrete inf-sup condition needs at least one
+        supremizer direction per pressure mode, but the supremizer snapshots'
+        energy decays at a different rate than the pressure snapshots', so the
+        same ``energy_threshold`` applied independently can (and, on a dense
+        enough parameter grid, does) yield ``r_sup < r_p`` -- an under-enriched,
+        near-singular reduced saddle-point system. ``min_sup`` enforces the
+        floor explicitly rather than relying on the two thresholds to agree.
         """
         pod_primary = cls.from_snapshots(S_u, M_inner,
                                          energy_threshold=energy_threshold,
                                          name=name)
         pod_sup = cls.from_snapshots(S_sup, M_inner,
                                      energy_threshold=energy_threshold,
-                                     name=f"{name}_sup")
+                                     name=f"{name}_sup", min_r=min_sup)
         Phi = np.concatenate([pod_primary.Phi, pod_sup.Phi], axis=1)
         Phi = _m_gram_schmidt(Phi, M_inner)
         # Some columns may collapse to zero after orthogonalisation; drop them.
@@ -322,6 +350,33 @@ class PODBasis:
 
     def modes_for_energy(self, level: float) -> int:
         return int(np.searchsorted(self.cum_energy, level) + 1)
+
+    def paired_indices(self, n: int) -> np.ndarray:
+        """Column indices for ``n`` primary + ``min(n, r_sup)`` supremizer modes.
+
+        Growing primary and supremizer modes in lockstep keeps the reduced
+        velocity-pressure pair inf-sup stable at every truncation level
+        (unlike :meth:`truncate`, which drops all supremizers below
+        ``r_primary``).
+        """
+        n_primary = min(n, self.r_primary)
+        n_sup = min(n, self.r_sup)
+        return np.concatenate([np.arange(n_primary),
+                               self.r_primary + np.arange(n_sup)])
+
+    def truncate_by_indices(self, idx: np.ndarray) -> "PODBasis":
+        """Return a copy keeping only the given (possibly non-contiguous) columns."""
+        idx = np.asarray(idx, dtype=int)
+        r_primary = int(np.sum(idx < self.r_primary))
+        r_sup = int(idx.size - r_primary)
+        return PODBasis(
+            Phi=self.Phi[:, idx].copy(),
+            sigmas=self.sigmas.copy(),
+            cum_energy=self.cum_energy.copy(),
+            r=idx.size, name=self.name,
+            energy_threshold=self.energy_threshold,
+            r_primary=r_primary, r_sup=r_sup,
+        )
 
     # ---- I/O ----
     def save(self, path: Path) -> None:

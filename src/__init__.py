@@ -5,7 +5,7 @@ Public API used across Tasks 1-4:
     from src import (
         Config, NavierStokesProblem, FOMSolver,
         ParameterSampler, SnapshotCollector, SupremizerEnricher, PODBasis,
-        ROMOperators, ROMSolver, ErrorAnalyzer, Visualizer,
+        ROMOperators, ROMSolver, ErrorAnalyzer, Visualizer, PINNModel,
     )
 """
 
@@ -16,6 +16,7 @@ from .pod import ParameterSampler, SnapshotCollector, SupremizerEnricher, PODBas
 from .rom import ROMOperators, ROMSolver
 from .analysis import ErrorAnalyzer
 from .visualization import Visualizer
+from .pinn import PINNModel
 
 __all__ = [
     "Config",
@@ -30,4 +31,5 @@ __all__ = [
     "ROMSolver",
     "ErrorAnalyzer",
     "Visualizer",
+    "PINNModel",
 ]

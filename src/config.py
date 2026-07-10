@@ -20,14 +20,19 @@ class Config:
     """Global hyperparameters and output paths."""
 
     # --- mesh / FE ---
-    mesh_n: int = 32                       # MxN UnitSquareMesh resolution
+    mesh_n: int = 64                       # MxN UnitSquareMesh resolution
     velocity_degree: int = 2               # P2 velocity
     pressure_degree: int = 1               # P1 pressure  (Taylor-Hood)
 
     # --- parameter space ---
     mu0_range: Tuple[float, float] = (0.1, 10.0)
     mu1_range: Tuple[float, float] = (1.0, 3.0)
-    n_train_per_dim: int = 8               # 8x8 = 64 training params
+    # The forcing term's cos(mu1^2 pi x)-type oscillation makes the solution
+    # manifold vary far more steeply along mu1 than along mu0 (mu0 mostly
+    # rescales amplitude; mu1 reshapes the field), so the training grid is
+    # deliberately anisotropic: many more samples along mu1 than mu0.
+    n_train_mu0: int = 25
+    n_train_mu1: int = 60                  # 25x60 = 1500 training params
     n_test: int = 15
     seed: int = 42
 
@@ -53,4 +58,4 @@ class Config:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
     def n_train(self) -> int:
-        return self.n_train_per_dim ** 2
+        return self.n_train_mu0 * self.n_train_mu1
