@@ -25,14 +25,52 @@ import numpy as np
 # ==========================================================================
 @dataclass
 class StandardScaler:
-    """Per-feature zero-mean/unit-std standardization."""
+    """Zero-mean standardization with per-feature *or* global-scalar scale.
+
+    ``global_scale=False`` (default) gives the usual per-feature unit-std
+    scaling -- correct for the network *input* (mu0, mu1), whose two columns
+    have unrelated units.
+
+    ``block_sizes`` (e.g. ``[r_u, r_p]``) applies **per-block** scaling:
+    each contiguous block of columns is divided by a *single* scalar std
+    computed over that block, while columns are still centred per-column.
+    This is the right choice for the POD-coefficient *targets*, which
+    concatenate a velocity block and a pressure block with very different
+    magnitudes (here ||c_p|| ~ 25x ||c_u||):
+
+    * A *single* global scale over the whole vector (the naive choice, and
+      the reference implementation's ``np.std(coefficient_matrix)``) is
+      dominated by the larger block, so the smaller block (velocity)
+      contributes negligibly to the MSE and the network leaves it near its
+      training mean -- catastrophic relative error on velocity.
+    * *Per-column* unit-variance scaling over-corrects the other way,
+      inflating the trailing near-zero modes to O(1) so the network wastes
+      capacity fitting numerical noise.
+
+    Per-block scaling balances the two physical blocks against each other in
+    the loss while preserving the POD energy hierarchy *within* each block,
+    so plain MSE fits both velocity and pressure. ``block_sizes=None`` (or a
+    single block) reduces to a plain global-scalar scale, and passing
+    per-column blocks reduces to per-column scaling.
+    """
     mean_: np.ndarray = field(default_factory=lambda: np.zeros(0))
     scale_: np.ndarray = field(default_factory=lambda: np.ones(0))
 
-    def fit(self, X: np.ndarray) -> "StandardScaler":
+    def fit(self, X: np.ndarray,
+            block_sizes: Optional[List[int]] = None) -> "StandardScaler":
         self.mean_ = X.mean(axis=0)
-        std = X.std(axis=0)
-        self.scale_ = np.where(std > 1e-12, std, 1.0)
+        if block_sizes is None:
+            std = X.std(axis=0)
+            self.scale_ = np.where(std > 1e-12, std, 1.0)
+        else:
+            assert sum(block_sizes) == X.shape[1], "block_sizes must cover all columns"
+            scale = np.ones(X.shape[1])
+            i = 0
+            for s in block_sizes:
+                blk_std = float(X[:, i:i + s].std())
+                scale[i:i + s] = blk_std if blk_std > 1e-12 else 1.0
+                i += s
+            self.scale_ = scale
         return self
 
     def transform(self, X: np.ndarray) -> np.ndarray:
@@ -173,25 +211,74 @@ class PODNNModel:
 
     def __init__(self, input_dim: int, output_dim: int,
                 hidden_sizes: Optional[List[int]] = None,
-                seed: int = 42) -> None:
+                seed: int = 42,
+                output_block_sizes: Optional[List[int]] = None) -> None:
         hidden_sizes = hidden_sizes if hidden_sizes is not None else [128, 128, 64]
         self.layer_sizes = [input_dim] + list(hidden_sizes) + [output_dim]
         self.net = FeedForwardNet(self.layer_sizes, seed=seed)
         self.x_scaler = StandardScaler()
         self.y_scaler = StandardScaler()
+        # Per-block (e.g. [r_u, r_p]) output scaling so the velocity and
+        # pressure coefficient blocks -- which differ ~25x in magnitude --
+        # contribute comparably to the MSE. See StandardScaler docstring.
+        self.output_block_sizes = output_block_sizes
+
+    def _relative_loss_step(self, Xtr_std: np.ndarray, Ytr_raw: np.ndarray,
+                            lr: float, weight_decay: float = 0.0,
+                            eps: float = 1e-8) -> float:
+        """One Adam step minimizing per-sample RELATIVE coefficient error,
+        i.e. ||pred - true||^2 / ||true||^2 (matching the eval metric --
+        relative L2, not raw MSE). Raw MSE lets high-energy samples (large
+        ||true||) dominate the gradient; normalizing per sample gives every
+        test point, including parameter-range edges where solution magnitude
+        may differ, equal weight in training.
+        """
+        pred_std, activations, preacts = self.net.forward(Xtr_std)
+        pred_raw = pred_std * self.y_scaler.scale_ + self.y_scaler.mean_
+        diff = pred_raw - Ytr_raw
+        true_sq_norm = np.sum(Ytr_raw ** 2, axis=1, keepdims=True) + eps
+        loss = float(np.mean(np.sum(diff ** 2, axis=1, keepdims=True) / true_sq_norm))
+        N = Xtr_std.shape[0]
+        dOut = (2.0 / N) * (diff / true_sq_norm) * self.y_scaler.scale_
+        dW, db = self.net._backward(activations, preacts, dOut)
+        if weight_decay > 0.0:
+            dW = [dw + weight_decay * w for dw, w in zip(dW, self.net.W)]
+        self.net._adam_step(dW, db, lr)
+        return loss
+
+    def _relative_loss_eval(self, Xval_std: np.ndarray, Yval_raw: np.ndarray,
+                            eps: float = 1e-8) -> float:
+        pred_raw = self.y_scaler.inverse_transform(self.net.predict(Xval_std))
+        diff = pred_raw - Yval_raw
+        true_sq_norm = np.sum(Yval_raw ** 2, axis=1, keepdims=True) + eps
+        return float(np.mean(np.sum(diff ** 2, axis=1, keepdims=True) / true_sq_norm))
 
     def fit(self, mu_train: np.ndarray, c_train: np.ndarray,
            mu_val: np.ndarray, c_val: np.ndarray,
            epochs: int = 5000, lr: float = 1e-3,
            patience: int = 300, weight_decay: float = 0.0,
-           verbose: bool = False
+           verbose: bool = False, loss_mode: str = "mse",
+           lr_decay_epoch_frac: Optional[float] = 0.5,
+           lr_decay_factor: float = 0.5,
            ) -> Tuple[np.ndarray, np.ndarray]:
+        """``loss_mode``: "mse" (default -- plain MSE on globally-scaled POD
+        coefficients, the reference PODNN configuration: a single global
+        output scale keeps the POD energy hierarchy so MSE concentrates on
+        the dominant modes) or "relative" (per-sample relative L2; kept for
+        comparison, but combined with the output standardisation it
+        over-weights trailing near-zero modes).
+
+        ``lr_decay_epoch_frac``/``lr_decay_factor``: one-time hard LR cut at
+        a fixed fraction of training (default: halve the LR at the 50%
+        mark), mirroring the reference PODNN implementation's schedule
+        (``optimizer.param_groups[0]["lr"] = 5e-5`` at ``epoch ==
+        round(epoch_max/2)``, from an initial ``lr=1e-4`` -- an exact
+        halving at the halfway point). Set to ``None`` to disable.
+        """
         self.x_scaler.fit(mu_train)
-        self.y_scaler.fit(c_train)
+        self.y_scaler.fit(c_train, block_sizes=self.output_block_sizes)
         Xtr = self.x_scaler.transform(mu_train)
-        Ytr = self.y_scaler.transform(c_train)
         Xval = self.x_scaler.transform(mu_val)
-        Yval = self.y_scaler.transform(c_val)
 
         train_hist = np.zeros(epochs)
         val_hist = np.zeros(epochs)
@@ -199,9 +286,26 @@ class PODNNModel:
         best_weights = self.net.get_weights()
         best_epoch = 0
         last_epoch = epochs - 1
+
+        if loss_mode == "relative":
+            step_fn = lambda: self._relative_loss_step(Xtr, c_train, lr, weight_decay=weight_decay)
+            eval_fn = lambda: self._relative_loss_eval(Xval, c_val)
+        else:
+            Ytr = self.y_scaler.transform(c_train)
+            Yval = self.y_scaler.transform(c_val)
+            step_fn = lambda: self.net.train_step(Xtr, Ytr, lr, weight_decay=weight_decay)
+            eval_fn = lambda: self.net.loss(Xval, Yval)
+
+        decay_epoch = (round(epochs * lr_decay_epoch_frac)
+                      if lr_decay_epoch_frac is not None else None)
+
         for ep in range(epochs):
-            tr_loss = self.net.train_step(Xtr, Ytr, lr, weight_decay=weight_decay)
-            val_loss = self.net.loss(Xval, Yval)
+            if decay_epoch is not None and ep == decay_epoch:
+                lr *= lr_decay_factor
+                if verbose:
+                    print(f"  epoch {ep:5d}  lr -> {lr:.3e}")
+            tr_loss = step_fn()
+            val_loss = eval_fn()
             train_hist[ep] = tr_loss
             val_hist[ep] = val_loss
             if val_loss < best_val - 1e-12:

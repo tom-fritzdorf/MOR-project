@@ -53,19 +53,65 @@ class ParameterSampler:
     def __init__(self, config: Config) -> None:
         self.config = config
 
-    def train(self) -> np.ndarray:
-        """Anisotropic tensor grid, shape ``(n_train_mu0 * n_train_mu1, 2)``.
+    @staticmethod
+    def _chebyshev_lobatto(a: float, b: float, n: int) -> np.ndarray:
+        """n points on [a, b], exact endpoints, density increasing toward
+        both edges (Chebyshev extrema, mapped from [-1, 1]).
 
-        mu1 gets a much finer grid than mu0: the forcing term's
-        cos(mu1^2 pi x)-type oscillation makes the solution manifold vary
-        far more steeply along mu1 (reshapes the field) than along mu0
-        (mostly rescales amplitude).
+        A PODNN trained on a uniform grid interpolates worst near the domain
+        boundary, where every training neighbor lies on only one side. This
+        node distribution deliberately over-samples both edges of each
+        parameter axis so the NN (and the POD basis it reconstructs from)
+        gets more support exactly where held-out error was previously worst.
+        """
+        if n == 1:
+            return np.array([0.5 * (a + b)])
+        k = np.arange(n)
+        x = -np.cos(k * np.pi / (n - 1))          # ascending, in [-1, 1], exact endpoints
+        return 0.5 * (a + b) + 0.5 * (b - a) * x
+
+    def train(self) -> np.ndarray:
+        """Latin Hypercube sample of ``n_train`` points, shape ``(n_train, 2)``.
+
+        The test set (see ``test``) is uniform-random over the box. A
+        *tensor grid* -- especially a Chebyshev grid clustered at the axis
+        edges -- creates a train/test distribution mismatch: it over-samples
+        the high-magnitude solution regions at the parameter-box corners and
+        under-samples the interior where most uniform-random test points
+        fall. Empirically this made the small-magnitude *velocity* POD
+        coefficients (whose norm is ~5x smaller on the interior test set than
+        on the edge-clustered grid) essentially unlearnable -- the network
+        saw mostly large-velocity edge cases and defaulted to the training
+        mean on the interior, giving ~100% relative velocity error.
+
+        Latin Hypercube Sampling instead fills the 2D box evenly with the
+        *same* distribution the test set is drawn from: each axis is split
+        into ``n_train`` equal-probability strata (linear-uniform, exactly
+        matching the test set's ``rng.uniform(*range)`` sampling) with one
+        point per stratum, and the two axes' strata are randomly paired.
+        LHS keeps the even 2D coverage of a grid (good for the POD basis)
+        while matching the test *distribution* (good for the NN regression):
+        test-agnostic -- no peeking at held-out points, unlike hand-placed
+        enrichment -- yet free of the edge-clustering magnitude bias, so the
+        velocity block is learned at its true in-distribution difficulty.
+
+        mu0 is sampled in **linear** space, not log: the test set is
+        linear-uniform on ``mu0_range``, so a log-uniform training grid
+        would itself be a train/test mismatch (over-weighting the low-mu0
+        decades the test set barely visits).
         """
         c = self.config
-        mu0 = np.linspace(c.mu0_range[0], c.mu0_range[1], c.n_train_mu0)
-        mu1 = np.linspace(c.mu1_range[0], c.mu1_range[1], c.n_train_mu1)
-        MM0, MM1 = np.meshgrid(mu0, mu1, indexing="ij")
-        return np.stack([MM0.ravel(), MM1.ravel()], axis=1)
+        n = c.n_train()
+        rng = np.random.default_rng(c.seed)
+
+        def _lhs_axis(lo: float, hi: float) -> np.ndarray:
+            edges = np.linspace(lo, hi, n + 1)
+            u = rng.uniform(edges[:-1], edges[1:])       # one point per stratum
+            return u[rng.permutation(n)]                 # break axis-to-axis correlation
+
+        mu0 = _lhs_axis(c.mu0_range[0], c.mu0_range[1])
+        mu1 = _lhs_axis(c.mu1_range[0], c.mu1_range[1])
+        return np.stack([mu0, mu1], axis=1)
 
     def test(self, train: Optional[np.ndarray] = None) -> np.ndarray:
         """Random samples in the same box, disjoint from the training grid."""

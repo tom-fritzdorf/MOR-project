@@ -119,17 +119,78 @@ class PINNModel:
     """
 
     def __init__(self, mu0_range: Tuple[float, float], mu1_range: Tuple[float, float],
-                hidden_sizes: Optional[List[int]] = None, seed: int = 42) -> None:
+                hidden_sizes: Optional[List[int]] = None, seed: int = 42,
+                n_fourier: int = 32, fourier_sigma: float = 4.0,
+                hard_bc: bool = False) -> None:
         self.mu0_range = mu0_range
         self.mu1_range = mu1_range
+        # Hard (exact) no-slip boundary constraint: velocity is written as
+        # u_i(x,mu) = phi(x) * N_i(x,mu) with phi(x)=16*x0(1-x0)*x1(1-x1),
+        # which is IDENTICALLY zero on dOmega. This removes the soft boundary
+        # penalty (MSE_b) entirely, so there is no boundary term for the
+        # physics term to trade off against -- and, crucially, the trivial
+        # u=0 solution is no longer a low-loss point (it gives residual = -f,
+        # which is large), so the optimiser is forced off the u~=0 attractor
+        # that made the soft-BC PINN collapse to ~1.0 error. Standard technique
+        # (Lagaris et al. 1998; Sukumar & Srivastava 2022). The pressure pin
+        # p(0,0)=0 is applied as a post-processing constant at evaluation
+        # (a constant shift does not affect grad p, so it is invisible to the
+        # residual anyway).
+        self.hard_bc = bool(hard_bc)
         self._mu0_mid = 0.5 * (mu0_range[0] + mu0_range[1])
         self._mu0_half = 0.5 * (mu0_range[1] - mu0_range[0])
         self._mu1_mid = 0.5 * (mu1_range[0] + mu1_range[1])
         self._mu1_half = 0.5 * (mu1_range[1] - mu1_range[0])
 
+        # --- random Fourier feature embedding of the spatial coordinate ---
+        # A plain tanh MLP suffers "spectral bias": it cannot represent the
+        # high-frequency spatial structure this problem's solution has --
+        # forcing ~ cos(mu1^2*pi*x) reaches ~4.5 oscillations across [0,1] at
+        # mu1=3, and the collapsed PINN (98.5% error, output ~0) is the direct
+        # symptom. Embedding x through gamma(x)=[x, sin(2*pi*B x), cos(2*pi*B x)]
+        # with random Gaussian frequencies B lets the net fit those frequencies
+        # (Tancik et al. 2020; Wang et al. 2021 for PINNs). This is purely an
+        # *input* transformation of the network w~(x, mu) -> (u1,u2,p); it does
+        # not touch the spec's loss MSE = MSE_b + lambda*MSE_p or the residual R.
+        self.n_fourier = int(n_fourier)
+        self.fourier_sigma = float(fourier_sigma)
+        if self.n_fourier > 0:
+            b_rng = np.random.default_rng(seed + 12345)
+            self.B = b_rng.normal(0.0, self.fourier_sigma, size=(2, self.n_fourier))
+            in_dim = 2 + 2 * self.n_fourier + 2   # [x, sin, cos] + [mu0n, mu1n]
+        else:
+            self.B = None
+            in_dim = 4
+
         hidden_sizes = hidden_sizes if hidden_sizes is not None else [64, 64, 64]
-        self.layer_sizes = [4] + list(hidden_sizes) + [3]
+        self.layer_sizes = [in_dim] + list(hidden_sizes) + [3]
         self.net = FeedForwardNet(self.layer_sizes, seed=seed)
+
+        # Per-mu1 residual scale g(mu1) = spatial-mean forcing energy at that
+        # mu1, precomputed on a grid and linearly interpolated. The forcing
+        # amplitude scales like mu1^3 (~100x across mu1 in [1,3]), so the
+        # residual must be normalised by a scale that ADAPTS to each sample's
+        # mu1 -- otherwise low-mu1 points are drowned out and never trained
+        # (the direct cause of the parametric plateau). Crucially this scale is
+        # CONSTANT over space for a given mu1 (a smooth function of mu1 only),
+        # so it does NOT over-weight the spatially low-forcing regions the way
+        # a per-point f(x)^2 normalisation did. This exactly generalises the
+        # per-batch single-mu normalisation (which reached ~0.5) to the
+        # parametric case. Still the spec's MSE = MSE_b + lambda*MSE_p (a fixed
+        # per-mu measure of the residual, single lambda).
+        _rng = np.random.default_rng(seed + 999)
+        _xs = _rng.uniform(0.0, 1.0, size=(4096, 2))
+        self._mu1_grid = np.linspace(mu1_range[0], mu1_range[1], 96)
+        _g = np.empty_like(self._mu1_grid)
+        for _i, _m1 in enumerate(self._mu1_grid):
+            _f1, _f2 = forcing_numpy(_xs[:, 0], _xs[:, 1], _m1)
+            _g[_i] = np.mean(_f1 ** 2 + _f2 ** 2)
+        self._g_vals = _g + 1e-8
+        self.f_ref2 = float(np.mean(_g))            # kept for reference/reporting
+
+    def _residual_scale(self, mu1: np.ndarray) -> np.ndarray:
+        """Per-sample residual normalisation scale g(mu1) (space-independent)."""
+        return np.interp(mu1, self._mu1_grid, self._g_vals)
 
     # ---- mu normalization ----
     def _norm_mu(self, mu: np.ndarray) -> np.ndarray:
@@ -137,13 +198,36 @@ class PINNModel:
         mu1n = (mu[:, 1] - self._mu1_mid) / self._mu1_half
         return np.column_stack([mu0n, mu1n])
 
+    def _embed_x(self, x: np.ndarray) -> np.ndarray:
+        """Spatial coordinate -> [x, sin(2*pi*B x), cos(2*pi*B x)] (or raw x)."""
+        if self.B is None:
+            return x
+        proj = 2.0 * np.pi * (x @ self.B)          # (N, n_fourier)
+        return np.concatenate([x, np.sin(proj), np.cos(proj)], axis=1)
+
+    @staticmethod
+    def _phi(x: np.ndarray) -> np.ndarray:
+        """No-slip bubble: phi(x)=16*x0(1-x0)*x1(1-x1), zero on dOmega, ~1 mid."""
+        return 16.0 * x[:, 0] * (1.0 - x[:, 0]) * x[:, 1] * (1.0 - x[:, 1])
+
     def _features(self, x: np.ndarray, mu: np.ndarray) -> np.ndarray:
-        return np.column_stack([x, self._norm_mu(mu)])
+        return np.column_stack([self._embed_x(x), self._norm_mu(mu)])
 
     # ---- inference ----
     def predict(self, x: np.ndarray, mu: np.ndarray) -> np.ndarray:
-        """``x`` (N,2), ``mu`` (N,2) -> (N,3) = (u1,u2,p)."""
-        return self.net.predict(self._features(x, mu))
+        """``x`` (N,2), ``mu`` (N,2) -> (N,3) = (u1,u2,p).
+
+        With ``hard_bc`` the velocity components are multiplied by the no-slip
+        bubble phi(x) so u=0 on dOmega exactly. The pressure pin is NOT applied
+        here (it is a post-processing constant; callers that need p(0,0)=0
+        subtract the predicted pressure at the origin)."""
+        out = self.net.predict(self._features(x, mu))
+        if self.hard_bc:
+            phi = self._phi(x)
+            out = out.copy()
+            out[:, 0] *= phi
+            out[:, 1] *= phi
+        return out
 
     # ---- physics-residual forward+backward (5-point FD stencil) ----
     def _physics_forward_backward(self, x_int: np.ndarray, mu_int: np.ndarray,
@@ -153,17 +237,35 @@ class PINNModel:
         mu0 = mu_int[:, 0]
         mu1 = mu_int[:, 1]
 
+        # Perturb the RAW spatial coordinate and re-embed for each stencil
+        # point -- with Fourier features the input columns are no longer raw x,
+        # so the derivative must be taken w.r.t. the true coordinate before the
+        # gamma(x) embedding. (Reduces to the old column-shift when B is None.)
+        e0 = np.array([h, 0.0]); e1 = np.array([0.0, h])
         Xc = self._features(x_int, mu_int)
-        Xp0 = Xc.copy(); Xp0[:, 0] += h
-        Xm0 = Xc.copy(); Xm0[:, 0] -= h
-        Xp1 = Xc.copy(); Xp1[:, 1] += h
-        Xm1 = Xc.copy(); Xm1[:, 1] -= h
+        Xp0 = self._features(x_int + e0, mu_int)
+        Xm0 = self._features(x_int - e0, mu_int)
+        Xp1 = self._features(x_int + e1, mu_int)
+        Xm1 = self._features(x_int - e1, mu_int)
 
         Yc, Ac, Pc = self.net.forward(Xc)
         Yp0, Ap0, Pp0 = self.net.forward(Xp0)
         Ym0, Am0, Pm0 = self.net.forward(Xm0)
         Yp1, Ap1, Pp1 = self.net.forward(Xp1)
         Ym1, Am1, Pm1 = self.net.forward(Xm1)
+
+        # Hard BC: compose velocity with the bubble phi at each stencil point,
+        # so the FD stencil differentiates the *constrained* field u=phi*N.
+        # phi is evaluated at that stencil's true coordinate (x +/- h*e_i).
+        if self.hard_bc:
+            phi_c = self._phi(x_int)
+            phi_p0 = self._phi(x_int + e0); phi_m0 = self._phi(x_int - e0)
+            phi_p1 = self._phi(x_int + e1); phi_m1 = self._phi(x_int - e1)
+            Yc[:, 0] *= phi_c;  Yc[:, 1] *= phi_c
+            Yp0[:, 0] *= phi_p0; Yp0[:, 1] *= phi_p0
+            Ym0[:, 0] *= phi_m0; Ym0[:, 1] *= phi_m0
+            Yp1[:, 0] *= phi_p1; Yp1[:, 1] *= phi_p1
+            Ym1[:, 0] *= phi_m1; Ym1[:, 1] *= phi_m1
 
         u1c, u2c = Yc[:, 0], Yc[:, 1]
 
@@ -188,15 +290,21 @@ class PINNModel:
         R2 = -mu0 * lap_u2 + conv2 + dpdx1 - f2
         R3 = du1dx0 + du2dx1
 
-        loss_p = float(np.mean(R1 ** 2 + R2 ** 2 + R3 ** 2))
+        # PER-SAMPLE residual normalisation: each collocation point's residual
+        # is scaled by its OWN local forcing magnitude (with a floor at a small
+        # fraction of the domain-mean f_ref2 to avoid over-weighting points
+        # where the forcing is near zero). The forcing amplitude varies ~100x
+        # across mu1 in [1,3] (f ~ mu1^3), so a single fixed scale (self.f_ref2)
+        # lets high-mu1 points dominate and leaves low-mu1 points untrained
+        # (their residual is divided by a far-too-large constant) -- the direct
+        # cause of the ~1.0 velocity-error plateau on the parametric problem.
+        # Per-mu1 residual scale (space-independent) -- balances the residual
+        # across the parameter range without over-weighting spatially
+        # low-forcing regions. See _residual_scale / __init__.
+        f_scale = self._residual_scale(mu1)                  # (n,) per sample
+        loss_p_norm = float(np.mean((R1 ** 2 + R2 ** 2 + R3 ** 2) / f_scale))
 
-        # Normalise by the mean squared forcing to keep MSE_p O(1) regardless
-        # of the forcing magnitude (which scales as mu1^3*pi^2 ~ O(100-300)).
-        # We compute the per-sample forcing scale and use its mean as divisor.
-        f_scale = float(np.mean(f1 ** 2 + f2 ** 2)) + 1e-8
-        loss_p_norm = float(np.mean(R1 ** 2 + R2 ** 2 + R3 ** 2) / f_scale)
-
-        # Adjoint: use normalized loss gradient (divide by f_scale)
+        # Adjoint: per-sample normalized loss gradient (divide by f_scale)
         dR1 = 2.0 * R1 / (n * f_scale)
         dR2 = 2.0 * R2 / (n * f_scale)
         dR3 = 2.0 * R3 / (n * f_scale)
@@ -262,6 +370,17 @@ class PINNModel:
         dYc[:, 0] += d_u1c
         dYc[:, 1] += d_u2c
 
+        # Hard BC chain rule: the residual derivatives above are w.r.t. the
+        # composed velocity u=phi*N; convert to gradients w.r.t. the raw net
+        # output N by multiplying the velocity columns by phi at each stencil
+        # point (pressure column unaffected). d(phi*N)/dN = phi.
+        if self.hard_bc:
+            dYc[:, 0] *= phi_c;  dYc[:, 1] *= phi_c
+            dYp0[:, 0] *= phi_p0; dYp0[:, 1] *= phi_p0
+            dYm0[:, 0] *= phi_m0; dYm0[:, 1] *= phi_m0
+            dYp1[:, 0] *= phi_p1; dYp1[:, 1] *= phi_p1
+            dYm1[:, 0] *= phi_m1; dYm1[:, 1] *= phi_m1
+
         dWc, dbc = self.net._backward(Ac, Pc, dYc)
         dWp0, dbp0 = self.net._backward(Ap0, Pp0, dYp0)
         dWm0, dbm0 = self.net._backward(Am0, Pm0, dYm0)
@@ -322,6 +441,96 @@ class PINNModel:
 
         total = lambda_b * loss_b + lambda_p * loss_p
         return total, loss_b, loss_p
+
+    # ======================================================================
+    # L-BFGS support: flat parameters + combined loss/grad on a FIXED batch
+    # ======================================================================
+    def get_flat_params(self) -> np.ndarray:
+        return np.concatenate([w.ravel() for w in self.net.W]
+                              + [b.ravel() for b in self.net.b])
+
+    def set_flat_params(self, theta: np.ndarray) -> None:
+        i = 0
+        for w in self.net.W:
+            n = w.size; w[:] = theta[i:i + n].reshape(w.shape); i += n
+        for b in self.net.b:
+            n = b.size; b[:] = theta[i:i + n].reshape(b.shape); i += n
+
+    def loss_and_grad(self, coll: Collocation, lambda_p: float, lambda_b: float,
+                      h: float = 1e-3) -> Tuple[float, np.ndarray]:
+        """Total loss and flat gradient on a FIXED collocation set (for L-BFGS,
+        which needs a deterministic objective -- no per-iteration resampling)."""
+        loss_p, dWp, dbp = self._physics_forward_backward(coll.x_int, coll.mu_int, h)
+        loss_b, dWb, dbb = self._boundary_forward_backward(
+            coll.x_bnd, coll.mu_bnd, coll.mu_pin)
+        loss = lambda_b * loss_b + lambda_p * loss_p
+        dW = [lambda_b * wb + lambda_p * wp for wb, wp in zip(dWb, dWp)]
+        db = [lambda_b * bb_ + lambda_p * bp for bb_, bp in zip(dbb, dbp)]
+        g = np.concatenate([w.ravel() for w in dW] + [b.ravel() for b in db])
+        return loss, g
+
+    def lbfgs(self, coll: Collocation, lambda_p: float, lambda_b: float,
+              h: float = 1e-3, max_iter: int = 1500, m: int = 20,
+              verbose: bool = False, eval_fn=None, log_every: int = 100
+              ) -> np.ndarray:
+        """Full-batch L-BFGS on the FIXED collocation set ``coll``.
+
+        The standard PINN optimiser: a limited-memory quasi-Newton method that
+        builds a curvature estimate from the last ``m`` (s, y) pairs (two-loop
+        recursion) and takes a backtracking-Armijo line search along the
+        resulting direction. Vastly more effective than first-order Adam at
+        driving a smooth PDE-residual loss down, which is exactly the bottleneck
+        the audit identified. Returns the per-iteration loss history.
+        """
+        theta = self.get_flat_params()
+
+        def f(th):
+            self.set_flat_params(th)
+            return self.loss_and_grad(coll, lambda_p, lambda_b, h)
+
+        loss, g = f(theta)
+        s_list: List[np.ndarray] = []; y_list: List[np.ndarray] = []
+        rho_list: List[float] = []
+        hist = np.zeros(max_iter)
+        for it in range(max_iter):
+            # two-loop recursion -> search direction d = -H_k g
+            q = g.copy(); alphas = []
+            for s, y, rho in zip(reversed(s_list), reversed(y_list), reversed(rho_list)):
+                a = rho * s.dot(q); alphas.append(a); q = q - a * y
+            gamma = (s_list[-1].dot(y_list[-1]) / y_list[-1].dot(y_list[-1])
+                     if y_list else 1.0)
+            r = gamma * q
+            for s, y, rho, a in zip(s_list, y_list, rho_list, reversed(alphas)):
+                b_ = rho * y.dot(r); r = r + (a - b_) * s
+            d = -r
+            gd = g.dot(d)
+            if gd >= 0:                      # not a descent dir -> steepest descent
+                d = -g; gd = -g.dot(g)
+            # backtracking Armijo line search
+            step = 1.0; loss_new = loss; g_new = g; ok = False
+            for _ in range(25):
+                th_new = theta + step * d
+                loss_new, g_new = f(th_new)
+                if np.isfinite(loss_new) and loss_new <= loss + 1e-4 * step * gd:
+                    ok = True; break
+                step *= 0.5
+            if not ok:                        # line search failed -> stop
+                self.set_flat_params(theta); hist = hist[:it]; break
+            s = th_new - theta; y = g_new - g; ys = y.dot(s)
+            if ys > 1e-10:                    # curvature condition
+                s_list.append(s); y_list.append(y); rho_list.append(1.0 / ys)
+                if len(s_list) > m:
+                    s_list.pop(0); y_list.pop(0); rho_list.pop(0)
+            theta, loss, g = th_new, loss_new, g_new
+            hist[it] = loss
+            if verbose and it % log_every == 0:
+                extra = ""
+                if eval_fn is not None:
+                    extra = f"  ~relL2(u) {eval_fn():.3f}"
+                print(f"  lbfgs {it:5d}  loss {loss:.3e}  |g| {np.linalg.norm(g):.2e}{extra}",
+                      flush=True)
+        self.set_flat_params(theta)
+        return hist
 
     def train(self, n_interior: int, n_boundary: int, n_pin: int,
              epochs: int, lr: float = 1e-3, lambda_p: float = 1.0,
@@ -425,6 +634,7 @@ class PINNModel:
     def save(self, path: Path) -> None:
         weights = self.net.get_weights()
         n = len(self.net.W)
+        B = self.B if self.B is not None else np.zeros((2, 0))
         np.savez_compressed(
             path,
             layer_sizes=np.array(self.layer_sizes),
@@ -433,6 +643,9 @@ class PINNModel:
             **{f"b{i}": weights[n + i] for i in range(n)},
             mu0_range=np.array(self.mu0_range),
             mu1_range=np.array(self.mu1_range),
+            n_fourier=np.array(self.n_fourier),
+            fourier_sigma=np.array(self.fourier_sigma),
+            B=B,
         )
 
     @classmethod
@@ -442,7 +655,13 @@ class PINNModel:
         n = int(d["n_weight_layers"])
         mu0_range = tuple(d["mu0_range"])
         mu1_range = tuple(d["mu1_range"])
-        model = cls(mu0_range, mu1_range, hidden_sizes=layer_sizes[1:-1])
+        n_fourier = int(d["n_fourier"]) if "n_fourier" in d else 0
+        fourier_sigma = float(d["fourier_sigma"]) if "fourier_sigma" in d else 4.0
+        model = cls(mu0_range, mu1_range, hidden_sizes=layer_sizes[1:-1],
+                    n_fourier=n_fourier, fourier_sigma=fourier_sigma)
+        # Restore the exact B used at train time (constructor draws a fresh one).
+        if n_fourier > 0 and "B" in d and d["B"].size:
+            model.B = d["B"]
         weights = [d[f"W{i}"] for i in range(n)] + [d[f"b{i}"] for i in range(n)]
         model.net.set_weights(weights)
         return model

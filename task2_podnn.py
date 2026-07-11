@@ -59,26 +59,28 @@ from src.podnn import PODNNModel, train_val_split
 # Ensemble/regularization hyperparameters (see the "Modelling notes" comment
 # block below main() for why these are needed -- a single, small, unregularized
 # net does not generalize on this problem).
-N_ENSEMBLE = 5
-HIDDEN_SIZES = [64, 64, 64]
+N_ENSEMBLE = 8
+HIDDEN_SIZES = [96, 96, 96, 64]
 WEIGHT_DECAY = 1e-4
-EPOCHS = 8000
+EPOCHS = 15000
 LR = 1e-3
-PATIENCE = 600
+PATIENCE = 1000
 VAL_FRAC = 0.15
 
 
 def mu_features(mu: np.ndarray) -> np.ndarray:
-    """Augment raw (mu0, mu1) with mu1**2.
+    """Raw (mu0, mu1) input, standardized downstream by the model's x_scaler.
 
-    The forcing term's own cos(mu1**2*pi*x) structure (see src/config.py)
-    means the solution -- and hence the POD coefficients -- vary smoothly in
-    mu1**2 but increasingly rapidly in raw mu1 as mu1 grows. Feeding mu1**2
-    directly removes a nonlinearity the net would otherwise have to discover
-    from only 160 training points; it is a fixed, data-independent
-    reparametrization of the same 2D input, not extra information.
+    Earlier revisions augmented this with mu1**2 and log10(mu0) engineered
+    features; those were dropped after they failed to help (and, combined
+    with per-dimension output standardization, tracked a large regression).
+    The reference PODNN implementation feeds raw (mu0, mu1) directly and the
+    network learns the nonlinearity itself -- the accuracy lever on this
+    problem is the *output* scaling (global-scalar, preserving the POD
+    energy hierarchy) and training-set coverage, not input feature
+    engineering.
     """
-    return np.column_stack([mu[:, 0], mu[:, 1], mu[:, 1] ** 2])
+    return np.column_stack([mu[:, 0], mu[:, 1]])
 
 
 def main() -> None:
@@ -167,7 +169,8 @@ def main() -> None:
         mu_tr, c_tr, mu_val, c_val = train_val_split(
             mu_train_f, c_train_all, val_frac=VAL_FRAC, seed=k)
         member = PODNNModel(input_dim=mu_train_f.shape[1], output_dim=r_out,
-                            hidden_sizes=HIDDEN_SIZES, seed=config.seed + k)
+                            hidden_sizes=HIDDEN_SIZES, seed=config.seed + k,
+                            output_block_sizes=[r_primary, r_p])
         th, vh = member.fit(mu_tr, c_tr, mu_val, c_val,
                             epochs=EPOCHS, lr=LR, patience=PATIENCE,
                             weight_decay=WEIGHT_DECAY, verbose=True)
@@ -251,7 +254,8 @@ def main() -> None:
         s_mu_tr, s_c_tr, s_mu_val, s_c_val = train_val_split(
             sub_mu, sub_c, val_frac=VAL_FRAC, seed=config.seed)
         sub_model = PODNNModel(input_dim=sub_mu.shape[1], output_dim=r_out,
-                               hidden_sizes=HIDDEN_SIZES, seed=config.seed)
+                               hidden_sizes=HIDDEN_SIZES, seed=config.seed,
+                               output_block_sizes=[r_primary, r_p])
         sub_model.fit(s_mu_tr, s_c_tr, s_mu_val, s_c_val,
                      epochs=2000, lr=LR, patience=150,
                      weight_decay=WEIGHT_DECAY, verbose=True)

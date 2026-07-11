@@ -20,20 +20,21 @@ class Config:
     """Global hyperparameters and output paths."""
 
     # --- mesh / FE ---
-    mesh_n: int = 64                       # MxN UnitSquareMesh resolution
+    mesh_n: int = 22                       # MxN UnitSquareMesh resolution (2*22*22=968 triangles)
     velocity_degree: int = 2               # P2 velocity
     pressure_degree: int = 1               # P1 pressure  (Taylor-Hood)
 
     # --- parameter space ---
     mu0_range: Tuple[float, float] = (0.1, 10.0)
     mu1_range: Tuple[float, float] = (1.0, 3.0)
-    # The forcing term's cos(mu1^2 pi x)-type oscillation makes the solution
-    # manifold vary far more steeply along mu1 than along mu0 (mu0 mostly
-    # rescales amplitude; mu1 reshapes the field), so the training grid is
-    # deliberately anisotropic: many more samples along mu1 than mu0.
+    # Training params are drawn by Latin Hypercube Sampling (see
+    # ParameterSampler.train), not a tensor grid, so these two factors now
+    # only set the *total* sample count n_train = n_train_mu0 * n_train_mu1.
+    # LHS matches the uniform-random test distribution, avoiding the
+    # edge-clustering magnitude bias a Chebyshev grid introduced.
     n_train_mu0: int = 25
-    n_train_mu1: int = 60                  # 25x60 = 1500 training params
-    n_test: int = 15
+    n_train_mu1: int = 60                  # 25*60 = 1500 LHS training params
+    n_test: int = 150                      # disjoint from train, full-range uniform coverage
     seed: int = 42
 
     # --- POD ---

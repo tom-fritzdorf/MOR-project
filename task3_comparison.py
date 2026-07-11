@@ -9,7 +9,7 @@ Task 2 already saved (`test_errors.npz` / `podnn_test_errors.npz`,
 `timing_data.npz` / `podnn_timing.npz`) and tabulates/plots them. Both
 methods were built (see the header comments of `task1_pod_galerkin.py` and
 `task2_podnn.py`) to be directly, index-for-index comparable:
-  - identical 15 held-out test parameters, identical FOM ground truth
+  - identical held-out test parameters, identical FOM ground truth
   - identical error machinery (`ErrorAnalyzer`, same FE mass/stiffness
     matrices), identical natural test-index row order
   - identical POD basis (PODNN reconstructs from the same primary velocity
@@ -49,6 +49,19 @@ def main() -> None:
     rom_timing = np.load(config.data_dir / "timing_data.npz")
     podnn_timing = np.load(config.data_dir / "podnn_timing.npz")
 
+    # Optional Task 4 (PINN): included only if evaluated on the same test set.
+    pinn_err = pinn_timing = None
+    try:
+        _pe = np.load(config.data_dir / "pinn_test_errors.npz")
+        _pt = np.load(config.data_dir / "pinn_timing.npz")
+        if _pe["test_params"].shape == rom_err["test_params"].shape and \
+                np.allclose(_pe["test_params"], rom_err["test_params"]):
+            pinn_err, pinn_timing = _pe, _pt
+        else:
+            print("  [warn] PINN test_params differ -- excluding PINN from comparison.")
+    except FileNotFoundError:
+        pass
+
     test_params = rom_err["test_params"]
     assert np.allclose(test_params, podnn_err["test_params"]), \
         "Task 1 / Task 2 test_params mismatch -- comparison would be invalid"
@@ -80,6 +93,7 @@ def main() -> None:
 
     rom_summary = summary(rom_err)
     podnn_summary = summary(podnn_err)
+    pinn_summary = summary(pinn_err) if pinn_err is not None else None
 
     # POD-truncation floor: PODNN's own diagnostic, reused here as the
     # accuracy ceiling both methods' bases could ever achieve.
@@ -91,7 +105,7 @@ def main() -> None:
     # --- 2. Per-test-point comparison table -----------------------------
     rows = []
     for i in range(M_test):
-        rows.append({
+        row = {
             "idx": i, "mu0": test_params[i, 0], "mu1": test_params[i, 1],
             "fom_time_s": rom_timing["fom_times_test"][i],
             "rom_time_s": rom_timing["rom_times_test"][i],
@@ -102,7 +116,15 @@ def main() -> None:
             "podnn_rel_l2_p": podnn_err["rel_l2_p"][i],
             "rom_rel_h1_u": rom_err["rel_h1_u"][i],
             "podnn_rel_h1_u": podnn_err["rel_h1_u"][i],
-        })
+        }
+        if pinn_err is not None:
+            row.update({
+                "pinn_time_s": pinn_timing["predict_times"][i],
+                "pinn_rel_l2_u": pinn_err["rel_l2_u"][i],
+                "pinn_rel_l2_p": pinn_err["rel_l2_p"][i],
+                "pinn_rel_h1_u": pinn_err["rel_h1_u"][i],
+            })
+        rows.append(row)
 
     table_path = config.data_dir / "comparison_table.csv"
     with open(table_path, "w", newline="") as f:
@@ -115,14 +137,20 @@ def main() -> None:
     rom_speedup = fom_mean / max(rom_mean, 1e-12)
     podnn_speedup = fom_mean / max(podnn_mean, 1e-12)
 
+    has_pinn = pinn_summary is not None
+    pcol = f"{'PINN':>14}" if has_pinn else ""
+    def _pval(key):
+        return f"{pinn_summary[key]:>14.3e}" if has_pinn else ""
+
     print("\n" + "-" * 64)
-    print("ACCURACY (relative to FOM, mean over 15 held-out test points)")
+    print(f"ACCURACY (relative to FOM, mean over {M_test} held-out test points)")
     print("-" * 64)
-    print(f"{'metric':<14}{'ROM':>14}{'PODNN':>14}")
+    print(f"{'metric':<14}{'ROM':>14}{'PODNN':>14}{pcol}")
     for key, label in [("mean_l2_u", "rel L2(u)"), ("mean_l2_p", "rel L2(p)"),
                         ("mean_h1_u", "rel H1(u)")]:
-        print(f"{label:<14}{rom_summary[key]:>14.3e}{podnn_summary[key]:>14.3e}")
-    print(f"{'max L2(u)':<14}{rom_summary['max_l2_u']:>14.3e}{podnn_summary['max_l2_u']:>14.3e}")
+        print(f"{label:<14}{rom_summary[key]:>14.3e}{podnn_summary[key]:>14.3e}{_pval(key)}")
+    print(f"{'max L2(u)':<14}{rom_summary['max_l2_u']:>14.3e}"
+          f"{podnn_summary['max_l2_u']:>14.3e}{_pval('max_l2_u')}")
 
     print("\n" + "-" * 64)
     print("COMPUTATIONAL COST")
@@ -132,11 +160,19 @@ def main() -> None:
           f"(speedup {rom_speedup:.1f}x)")
     print(f"Mean PODNN predict time (online): {podnn_mean:.6f} s   "
           f"(speedup {podnn_speedup:.1f}x)")
+    if has_pinn:
+        pinn_mean = float(pinn_timing["predict_mean"])
+        pinn_speedup = fom_mean / max(pinn_mean, 1e-12)
+        print(f"Mean PINN predict time (online):  {pinn_mean:.6f} s   "
+              f"(speedup {pinn_speedup:.1f}x)")
     print(f"\nShared offline (snapshots + POD): {shared_offline:.2f} s  (counted once)")
     print(f"  + ROM Galerkin operator assembly: {rom_assembly:.2f} s  "
           f"-> ROM offline total   {rom_offline_total:.2f} s")
     print(f"  + PODNN ensemble training:        {podnn_train_time:.2f} s  "
           f"-> PODNN offline total {podnn_offline_total:.2f} s")
+    if has_pinn:
+        print(f"PINN offline (training only, NO shared snapshots/POD): "
+              f"{float(pinn_timing['train_time']):.2f} s")
 
     print("\n" + "-" * 64)
     print("INTERPRETATION")
@@ -154,7 +190,7 @@ def main() -> None:
           "pays a non-affine forcing FEM assembly online (mu1-dependent, "
           "O(N_h)); PODNN pays zero FEM cost online (one NN forward pass + "
           "basis matvec) but its accuracy is capped by how well a small net "
-          "can regress POD coefficients from only 160 training snapshots -- "
+          f"can regress POD coefficients from only {config.n_train()} training snapshots -- "
           "not by the POD basis itself (PODNN's own POD-truncation-floor "
           "diagnostic in Task 2 shows the achievable floor is close to ROM's "
           "actual error).")
@@ -185,12 +221,22 @@ def main() -> None:
     report_floor = err_analyzer.batch_report(u_fom_test, p_fom_test, U_floor, P_floor)
     floor_summary = report_floor.summary()
 
-    vis.plot_comparison_accuracy(rom_summary, podnn_summary, floor_summary)
+    # PINN args (only when Task 4 artefacts are present & aligned)
+    p_mean = float(pinn_timing["predict_mean"]) if pinn_err is not None else None
+    p_train = float(pinn_timing["train_time"]) if pinn_err is not None else None
+    p_err_l2u = pinn_summary["mean_l2_u"] if pinn_summary is not None else None
+    p_err_pp = pinn_err["rel_l2_u"] if pinn_err is not None else None
+
+    vis.plot_comparison_accuracy(rom_summary, podnn_summary, floor_summary,
+                                 pinn_summary=pinn_summary)
     vis.plot_comparison_cost(fom_mean, rom_mean, podnn_mean, shared_offline,
-                             rom_assembly, podnn_train_time)
+                             rom_assembly, podnn_train_time,
+                             pinn_mean=p_mean, pinn_train=p_train)
     vis.plot_comparison_tradeoff(rom_mean, rom_summary["mean_l2_u"],
                                  podnn_mean, podnn_summary["mean_l2_u"],
-                                 test_params, rom_err["rel_l2_u"], podnn_err["rel_l2_u"])
+                                 test_params, rom_err["rel_l2_u"], podnn_err["rel_l2_u"],
+                                 pinn_mean_time=p_mean, pinn_mean_err=p_err_l2u,
+                                 pinn_err_per_point=p_err_pp)
     print(f"Saved 3 plots to: {config.plots_dir}")
 
     print("\n" + "=" * 64)

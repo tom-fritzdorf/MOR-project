@@ -26,6 +26,7 @@ import matplotlib.tri as mtri
 import numpy as np
 import pandas as pd
 import seaborn as sns
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers the '3d' projection)
 
 from .problem import NavierStokesProblem
 
@@ -539,28 +540,37 @@ class Visualizer:
     def plot_comparison_accuracy(self, rom_summary: Dict[str, float],
                                  podnn_summary: Dict[str, float],
                                  floor_summary: Dict[str, float],
+                                 pinn_summary: Optional[Dict[str, float]] = None,
                                  filename: str = "18_comparison_accuracy.png"
                                  ) -> Path:
-        """Grouped bars: mean rel. L2(u)/L2(p)/H1(u) for ROM vs PODNN, with
-        the POD-truncation floor (best either method's basis could achieve)
-        marked as a reference line on each group."""
+        """Grouped bars: mean rel. L2(u)/L2(p)/H1(u) for ROM vs PODNN (and PINN
+        if given), with the POD-truncation floor (best either projection-based
+        method's basis could achieve) marked as a reference line."""
         metrics = [("mean_l2_u", "$L^2(u)$"), ("mean_l2_p", "$L^2(p)$"),
                    ("mean_h1_u", "$H^1(u)$")]
-        df = pd.concat([
+        frames = [
             pd.DataFrame({"metric": [lbl for _, lbl in metrics],
                           "error": [rom_summary[k] for k, _ in metrics],
                           "method": "ROM (Galerkin)"}),
             pd.DataFrame({"metric": [lbl for _, lbl in metrics],
                           "error": [podnn_summary[k] for k, _ in metrics],
                           "method": "PODNN"}),
-        ], ignore_index=True)
+        ]
+        if pinn_summary is not None:
+            frames.append(pd.DataFrame({"metric": [lbl for _, lbl in metrics],
+                          "error": [pinn_summary[k] for k, _ in metrics],
+                          "method": "PINN"}))
+        df = pd.concat(frames, ignore_index=True)
 
         fig, ax = plt.subplots(figsize=(8.5, 5.5))
         sns.barplot(data=df, x="metric", y="error", hue="method",
                    palette=_PALETTE, ax=ax)
         ax.set_yscale("log")
         ax.set_xlabel(""); ax.set_ylabel("Mean relative error on test set")
-        ax.set_title("Task 3 -- ROM vs PODNN accuracy (relative to FOM)")
+        _title = ("Task 3/4 -- ROM vs PODNN vs PINN accuracy (rel. to FOM)"
+                  if pinn_summary is not None
+                  else "Task 3 -- ROM vs PODNN accuracy (relative to FOM)")
+        ax.set_title(_title)
         floor_l2u = floor_summary.get("mean_l2_u")
         if floor_l2u is not None:
             ax.axhline(floor_l2u, color="grey", linestyle="--", linewidth=1.3,
@@ -575,16 +585,21 @@ class Visualizer:
     def plot_comparison_cost(self, fom_mean: float, rom_mean: float,
                              podnn_mean: float, shared_offline: float,
                              rom_increment: float, podnn_increment: float,
+                             pinn_mean: Optional[float] = None,
+                             pinn_train: Optional[float] = None,
                              filename: str = "19_comparison_cost.png") -> Path:
         """Two panels: (left) per-query online wall time, (right) offline
         cost decomposed into the shared snapshot+POD cost and each method's
-        own increment, so the shared part is never double counted."""
+        own increment, so the shared part is never double counted. If PINN
+        args are given it is added -- with its offline shown as a *standalone*
+        training bar (PINN needs no shared snapshots/POD)."""
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
 
-        df_online = pd.DataFrame({
-            "stage": ["FOM", "ROM", "PODNN"],
-            "time": [fom_mean, rom_mean, podnn_mean],
-        })
+        online_stage = ["FOM", "ROM", "PODNN"]
+        online_time = [fom_mean, rom_mean, podnn_mean]
+        if pinn_mean is not None:
+            online_stage.append("PINN"); online_time.append(pinn_mean)
+        df_online = pd.DataFrame({"stage": online_stage, "time": online_time})
         sns.barplot(data=df_online, x="stage", y="time", hue="stage",
                    palette=_PALETTE, legend=False, ax=axes[0])
         axes[0].set_yscale("log")
@@ -594,16 +609,20 @@ class Visualizer:
             axes[0].text(bar.get_x() + bar.get_width() / 2, v * 1.05,
                         f"{v:.3g}s", ha="center", fontsize=9.5)
 
-        df_offline = pd.concat([
+        off_frames = [
             pd.DataFrame({"stage": ["Shared\n(snapshots+POD)"], "time": [shared_offline],
                           "part": "Shared"}),
             pd.DataFrame({"stage": ["ROM\nincrement"], "time": [rom_increment],
                           "part": "Method-specific"}),
             pd.DataFrame({"stage": ["PODNN\nincrement"], "time": [podnn_increment],
                           "part": "Method-specific"}),
-        ], ignore_index=True)
+        ]
+        if pinn_train is not None:
+            off_frames.append(pd.DataFrame({"stage": ["PINN\n(standalone)"],
+                          "time": [pinn_train], "part": "No shared cost"}))
+        df_offline = pd.concat(off_frames, ignore_index=True)
         sns.barplot(data=df_offline, x="stage", y="time", hue="part",
-                   palette=_PALETTE, legend=False, ax=axes[1])
+                   palette=_PALETTE, legend=(pinn_train is not None), ax=axes[1])
         axes[1].set_yscale("log")
         axes[1].set_xlabel(""); axes[1].set_ylabel("Wall time (s)")
         axes[1].set_title("Offline cost breakdown (shared cost counted once)")
@@ -611,7 +630,7 @@ class Visualizer:
             axes[1].text(bar.get_x() + bar.get_width() / 2, v * 1.05,
                         f"{v:.3g}s", ha="center", fontsize=9.5)
 
-        fig.suptitle("Task 3 -- computational cost vs FOM", fontsize=14)
+        fig.suptitle("Task 3/4 -- computational cost vs FOM", fontsize=14)
         out = self._savepath(filename)
         return self._finish(fig, out)
 
@@ -623,10 +642,13 @@ class Visualizer:
                                  test_params: np.ndarray,
                                  rom_err_per_point: np.ndarray,
                                  podnn_err_per_point: np.ndarray,
+                                 pinn_mean_time: Optional[float] = None,
+                                 pinn_mean_err: Optional[float] = None,
+                                 pinn_err_per_point: Optional[np.ndarray] = None,
                                  filename: str = "20_comparison_tradeoff.png"
                                  ) -> Path:
         """(left) accuracy-vs-online-cost scatter (lower-left is better);
-        (right) paired per-test-point rel. L2(u) error, ROM vs PODNN."""
+        (right) paired per-test-point rel. L2(u) error. PINN added if given."""
         fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
         pal = sns.color_palette(_PALETTE)
 
@@ -634,6 +656,9 @@ class Visualizer:
                         color=pal[0], edgecolor="black", linewidth=0.8, label="ROM")
         axes[0].scatter([podnn_mean_time], [podnn_mean_err], s=180, marker="^",
                         color=pal[1], edgecolor="black", linewidth=0.8, label="PODNN")
+        if pinn_mean_time is not None and pinn_mean_err is not None:
+            axes[0].scatter([pinn_mean_time], [pinn_mean_err], s=180, marker="s",
+                            color=pal[2], edgecolor="black", linewidth=0.8, label="PINN")
         axes[0].set_xscale("log"); axes[0].set_yscale("log")
         axes[0].set_xlabel("Mean online wall time (s)")
         axes[0].set_ylabel("Mean relative $L^2(u)$ error")
@@ -641,19 +666,24 @@ class Visualizer:
         axes[0].legend(title=None)
 
         idx = np.arange(len(test_params))
-        df = pd.concat([
+        frames = [
             pd.DataFrame({"test_point": idx, "error": rom_err_per_point, "method": "ROM"}),
             pd.DataFrame({"test_point": idx, "error": podnn_err_per_point, "method": "PODNN"}),
-        ], ignore_index=True)
+        ]
+        if pinn_err_per_point is not None:
+            frames.append(pd.DataFrame({"test_point": idx,
+                          "error": pinn_err_per_point, "method": "PINN"}))
+        df = pd.concat(frames, ignore_index=True)
         sns.lineplot(data=df, x="test_point", y="error", hue="method", style="method",
                     markers=True, dashes=False, markersize=3, linewidth=0.8, ax=axes[1])
         axes[1].set_yscale("log")
         axes[1].set_xlabel("Test point index (natural order)")
         axes[1].set_ylabel("Relative $L^2(u)$ error")
-        axes[1].set_title("Per-test-point error, ROM vs PODNN")
+        _mlist = "ROM vs PODNN" + (" vs PINN" if pinn_err_per_point is not None else "")
+        axes[1].set_title(f"Per-test-point error, {_mlist}")
         axes[1].legend(title=None)
 
-        fig.suptitle("Task 3 -- accuracy/speed trade-off", fontsize=14)
+        fig.suptitle("Task 3/4 -- accuracy/speed trade-off", fontsize=14)
         out = self._savepath(filename)
         return self._finish(fig, out)
 
@@ -791,3 +821,40 @@ class Visualizer:
         fig.suptitle("Task 4 -- PINN vs ROM vs PODNN vs FOM", fontsize=14)
         out = self._savepath(filename)
         return self._finish(fig, out)
+
+    # =====================================================================
+    # Plot 25: 3D error surfaces over the (mu0, mu1) test-parameter plane
+    # =====================================================================
+    def plot_error_surface_3d(self, test_params: np.ndarray,
+                              rom_error: np.ndarray, podnn_error: np.ndarray,
+                              metric_name: str = "rel $L^2(u)$ error",
+                              filename: str = "25_error_surface_3d.png") -> Path:
+        """Side-by-side 3D error surfaces (Delaunay-triangulated scatter) for
+        ROM and PODNN over the held-out test set's (mu0, mu1) plane.
+
+        Independent z-scale/colorbar per panel -- ROM and PODNN errors differ
+        by roughly an order of magnitude on this basis, so a shared z-axis
+        would flatten the ROM panel into visual noise; the accuracy bar chart
+        (18_comparison_accuracy.png) is where the cross-method magnitude
+        comparison lives, this plot is for spatial error pattern only.
+        """
+        mu0, mu1 = test_params[:, 0], test_params[:, 1]
+        fig = plt.figure(figsize=(14, 6))
+        for i, (label, err) in enumerate([("ROM", rom_error), ("PODNN", podnn_error)]):
+            ax = fig.add_subplot(1, 2, i + 1, projection="3d")
+            surf = ax.plot_trisurf(mu0, mu1, err, cmap="viridis",
+                                   linewidth=0.1, antialiased=True)
+            fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+            ax.set_xlabel("$\\mu_0$")
+            ax.set_ylabel("$\\mu_1$")
+            ax.set_zlabel(metric_name)
+            ax.set_title(f"{label}: {metric_name}\n"
+                        f"(mean {err.mean():.2e}, max {err.max():.2e})")
+        fig.suptitle("Error surfaces over the test parameter space", fontsize=14)
+        # Not routed through _finish(): sns.despine() assumes 2D-style spines
+        # and errors on Axes3D objects.
+        fig.tight_layout()
+        out = self._savepath(filename)
+        fig.savefig(out, dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        return out

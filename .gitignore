@@ -219,3 +219,7 @@ __marimo__/
 
 Miniconda3-latest-MacOSX-arm64.sh
 *.pdf
+professor's lab
+*.npz
+.pkl
+.npz
